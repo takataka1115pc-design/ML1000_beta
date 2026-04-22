@@ -1,0 +1,287 @@
+```html
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MP2 Audio Extractor</title>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #f1f1f1; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useRef, useEffect } = React;
+        
+        // --- Logic Functions ---
+        
+        function parseMP2Header(data, offset) {
+            if (offset + 4 > data.length) return null;
+            const b0 = data[offset];
+            const b1 = data[offset + 1];
+            const b2 = data[offset + 2];
+            if (b0 !== 0xFF || (b1 & 0xE0) !== 0xE0) return null;
+            const versionId = (b1 >> 3) & 0x03;
+            const layer = (b1 >> 1) & 0x03;
+            if (layer !== 2) return null;
+            const bitrateIdx = (b2 >> 4) & 0x0F;
+            const sampleRateIdx = (b2 >> 2) & 0x03;
+            const padding = (b2 >> 1) & 0x01;
+            if (bitrateIdx === 0 || bitrateIdx === 15 || sampleRateIdx === 3) return null;
+            const bitrates = (versionId === 3) ? [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0] : [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+            const sampleRates = (versionId === 3) ? [44100, 48000, 32000, 0] : (versionId === 2) ? [22050, 24000, 16000, 0] : [11025, 12000, 8000, 0];
+            const bitrate = bitrates[bitrateIdx] * 1000;
+            const sampleRate = sampleRates[sampleRateIdx];
+            const frameSize = Math.floor((144 * bitrate) / sampleRate) + padding;
+            return { frameSize, bitrate, sampleRate };
+        }
+
+        function extractAllFileNames(data) {
+            const decoder = new TextDecoder('ascii');
+            const text = decoder.decode(data);
+            const regex = /[A-Z0-9_\-\s]{1,32}\.(MP2|MPA|WAV|DAT|BIN)/gi;
+            let matches = [];
+            let match;
+            while ((match = regex.exec(text)) !== null) {
+                const name = match[0].trim();
+                if (name.length > 4) matches.push(name);
+            }
+            return [...new Set(matches)];
+        }
+
+        // --- Components ---
+
+        const Icon = ({ name, size = 20, className = "" }) => {
+            const [icon, setIcon] = useState(null);
+            useEffect(() => {
+                if (window.lucide) {
+                    const iconMarkup = window.lucide.icons[name];
+                    if (iconMarkup) setIcon(name);
+                }
+            }, [name]);
+            if (!icon) return <div style={{ width: size, height: size }} className={className}></div>;
+            return <i data-lucide={icon} className={className} style={{ width: size, height: size }}></i>;
+        };
+
+        function App() {
+            const [file, setFile] = useState(null);
+            const [status, setStatus] = useState('idle');
+            const [progress, setProgress] = useState(0);
+            const [logs, setLogs] = useState([]);
+            const [streams, setStreams] = useState([]);
+            const logEndRef = useRef(null);
+
+            useEffect(() => {
+                if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: "smooth" });
+                if (window.lucide) window.lucide.createIcons();
+            }, [logs, streams]);
+
+            const addLog = (msg) => setLogs(p => [...p, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+
+            const handleFileChange = (e) => {
+                const f = e.target.files[0];
+                if (f) {
+                    setFile(f);
+                    setStatus('idle');
+                    setLogs([]);
+                    setStreams([]);
+                    addLog(`ファイル: ${f.name} が読み込まれました`);
+                }
+            };
+
+            const handleExtract = async () => {
+                if (!file) return;
+                setStatus('analyzing');
+                setLogs([]);
+                addLog("バイナリ解析を開始...");
+
+                try {
+                    const buffer = await file.arrayBuffer();
+                    const data = new Uint8Array(buffer);
+                    const len = data.length;
+
+                    addLog("ファイル名リストを検索中...");
+                    const names = extractAllFileNames(data);
+                    addLog(`${names.length} 個のファイル名が見つかりました。`);
+
+                    let offset = 0;
+                    let foundCount = 0;
+                    const results = [];
+                    const CHUNK = 2000000;
+                    let lastUpdate = 0;
+
+                    while (offset < len - 4) {
+                        if (offset - lastUpdate > CHUNK) {
+                            setProgress(offset / len);
+                            await new Promise(r => setTimeout(r, 0));
+                            lastUpdate = offset;
+                        }
+
+                        const header = parseMP2Header(data, offset);
+                        if (header) {
+                            let streamOffset = offset;
+                            let frames = [];
+                            let totalSize = 0;
+
+                            // ギャップ許容 0 の厳格分割モード
+                            while (streamOffset < len - 4) {
+                                const h = parseMP2Header(data, streamOffset);
+                                if (h && (streamOffset + h.frameSize <= len)) {
+                                    frames.push(data.slice(streamOffset, streamOffset + h.frameSize));
+                                    totalSize += h.frameSize;
+                                    streamOffset += h.frameSize;
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            if (frames.length > 0) {
+                                foundCount++;
+                                const finalBuffer = new Uint8Array(totalSize);
+                                let ptr = 0;
+                                for (const f of frames) { finalBuffer.set(f, ptr); ptr += f.length; }
+
+                                const blob = new Blob([finalBuffer], { type: 'audio/mpeg' });
+                                let rawName = names[foundCount - 1] || `TRACK_${foundCount.toString().padStart(3, '0')}`;
+                                const cleanName = rawName.replace(/\.(mp2|mpa|wav|dat|bin)$/i, "");
+
+                                results.push({
+                                    id: foundCount,
+                                    name: cleanName,
+                                    fileName: rawName.toLowerCase().endsWith('.mp2') ? rawName : `${cleanName}.mp2`,
+                                    size: totalSize,
+                                    url: URL.createObjectURL(blob),
+                                    offset: offset,
+                                    sampleRate: header.sampleRate
+                                });
+                                addLog(`抽出: ${cleanName} (0x${offset.toString(16).toUpperCase()})`);
+                                offset = streamOffset;
+                                continue;
+                            }
+                        }
+                        offset++;
+                    }
+
+                    setStreams(results);
+                    setStatus('success');
+                    setProgress(1);
+                    addLog(`完了！ ${results.length} 個の音声ファイルを抽出しました。`);
+                } catch (e) {
+                    addLog(`エラー: ${e.message}`);
+                    setStatus('error');
+                }
+            };
+
+            return (
+                <div className="min-h-screen p-4 md:p-12">
+                    <div className="max-w-4xl mx-auto space-y-8">
+                        {/* Title Section */}
+                        <div className="flex items-center gap-5">
+                            <div className="bg-indigo-600 p-4 rounded-2xl text-white shadow-xl">
+                                <Icon name="ListMusic" size={32} />
+                            </div>
+                            <div>
+                                <h1 className="text-3xl font-black text-slate-900 tracking-tight">MP2 Audio Extractor</h1>
+                                <p className="text-slate-500 font-medium italic">Powered by Binary Analysis</p>
+                            </div>
+                        </div>
+
+                        {/* Upload & Action */}
+                        <div className="bg-white p-8 rounded-[40px] shadow-sm border border-slate-200 text-center relative overflow-hidden">
+                            <input type="file" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" />
+                            <div className="space-y-4">
+                                <div className="w-24 h-24 bg-slate-50 rounded-full flex items-center justify-center mx-auto text-slate-300">
+                                    <Icon name="Upload" size={40} />
+                                </div>
+                                <div className="space-y-1">
+                                    <p className="text-xl font-bold text-slate-700">{file ? file.name : "ファイルを読み込む"}</p>
+                                    <p className="text-sm text-slate-400 font-medium">DDI, BIN などのデータイメージを選択</p>
+                                </div>
+                                {file && status !== 'analyzing' && (
+                                    <button 
+                                        onClick={(e) => { e.stopPropagation(); handleExtract(); }}
+                                        className="relative z-20 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 px-16 rounded-2xl shadow-2xl transition-all flex items-center justify-center gap-3 mx-auto"
+                                    >
+                                        <Icon name="Search" /> 解析と抽出を開始
+                                    </button>
+                                )}
+                            </div>
+
+                            {status === 'analyzing' && (
+                                <div className="mt-8 space-y-3">
+                                    <div className="h-3 w-full bg-slate-100 rounded-full overflow-hidden">
+                                        <div className="h-full bg-indigo-600 transition-all duration-300" style={{ width: `${progress * 100}%` }}></div>
+                                    </div>
+                                    <p className="text-[10px] font-black text-indigo-500 uppercase tracking-[0.2em] animate-pulse">Scanning Byte Patterns...</p>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Logs */}
+                        <div className="bg-slate-900 rounded-[32px] p-6 h-56 overflow-y-auto font-mono text-[11px] shadow-2xl border border-slate-800 custom-scrollbar">
+                            <div className="text-slate-600 mb-3 pb-2 border-b border-slate-800 flex items-center gap-2 font-bold">
+                                <Icon name="Activity" size={12} /> ENGINE LOG
+                            </div>
+                            {logs.map((log, i) => (
+                                <div key={i} className="text-indigo-300 mb-1 opacity-90">{log}</div>
+                            ))}
+                            <div ref={logEndRef} />
+                        </div>
+
+                        {/* Result List */}
+                        {status === 'success' && (
+                            <div className="grid grid-cols-1 gap-4 pb-20">
+                                {streams.map((s) => (
+                                    <div key={s.id} className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100 flex items-center gap-6 hover:border-indigo-300 transition-all group">
+                                        <div className="w-12 h-12 bg-slate-50 rounded-2xl flex items-center justify-center text-slate-300 group-hover:bg-indigo-50 group-hover:text-indigo-500 transition-colors shrink-0">
+                                            <Icon name="Music" size={24} />
+                                        </div>
+                                        <div className="flex-1 min-w-0">
+                                            <h3 className="text-base font-bold text-slate-800 truncate">{s.name}</h3>
+                                            <div className="flex items-center gap-4 text-[10px] text-slate-400 mt-1 font-bold uppercase tracking-wider">
+                                                <span className="bg-slate-100 px-2 py-0.5 rounded text-slate-500 font-mono">0x{s.offset.toString(16).toUpperCase()}</span>
+                                                <span>{(s.size / 1024).toFixed(1)} KB</span>
+                                                <span>{s.sampleRate / 1000}kHz</span>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-4 shrink-0">
+                                            <audio src={s.url} controls className="h-8 w-40 md:w-56" />
+                                            <a 
+                                                href={s.url} 
+                                                download={s.fileName}
+                                                className="bg-indigo-600 hover:bg-black text-white p-3 rounded-2xl transition-colors shadow-lg"
+                                            >
+                                                <Icon name="Download" size={18} />
+                                            </a>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
+
+```
